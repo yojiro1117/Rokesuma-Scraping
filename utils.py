@@ -1,144 +1,137 @@
-"""Utility functions for the ロケスマ scraping project.
+"""Utility functions for the ロケスマ scraping application.
 
-This module groups together a variety of helper functions used across the
-application.  They include regular expression helpers for extracting
-phone numbers, addresses and opening hours from unstructured text,
-distance calculations using the haversine formula and text normalisation
-for deduplication.
+This module contains helper routines for extracting information
+using regular expressions, computing distances and deduplicating
+rows.  Isolating these concerns outside of the scraper simplifies
+testing and keeps the scraping code focused on browser automation.
 """
+
+from __future__ import annotations
 
 import re
 import math
-import unicodedata
-from typing import List, Tuple, Optional
-
-import numpy as np
+import urllib.parse
+from typing import Iterable, List, Dict, Optional, Tuple, Any
 
 
-def get_categories_list() -> List[str]:
-    """Return a static list of categories supported by the application.
+# Regular expression patterns for phone numbers, addresses and hours.
+_PHONE_RE = re.compile(r"\d{2,4}-\d{2,4}-\d{3,4}")
+_POSTCODE_RE = re.compile(r"〒?\d{3}-\d{4}")
 
-    The list is derived from the ロケスマ service and covers typical
-    chain store categories.  If the web UI exposes categories dynamically
-    it may be desirable to fetch them at runtime, however for reliability
-    a static list is provided here.
 
-    Returns
-    -------
-    List[str]
-        Names of categories in Japanese.
+def extract_phone(text: str) -> str:
+    """Extract a phone number from the given text.
+
+    The pattern matches Japanese phone numbers in the form
+    `xxx-xxxx-xxxx` or `xx-xxxx-xxxx`.  If no phone number is found
+    an empty string is returned.
     """
-    return [
-        "コンビニ",
-        "ドラッグストア",
-        "調剤薬局",
-        "スーパー",
-        "飲食",
-        "カフェ",
-        "銀行",
-        "ATM",
-        "郵便局",
-        "公共施設",
-        "学校",
-        "ガソリンスタンド",
-        "コインランドリー",
-        "家電量販店",
-        "書店",
-        "百貨店",
-        "病院・診療所",
-    ]
-
-
-def normalize_text(text: str) -> str:
-    """Normalise Japanese text by converting full/half width characters and trimming spaces."""
-    if not isinstance(text, str):
+    if not text:
         return ""
-    normalized = unicodedata.normalize("NFKC", text)
-    normalized = normalized.replace("\u3000", " ")  # full width space to normal space
-    normalized = normalized.strip()
-    return normalized
+    match = _PHONE_RE.search(text)
+    return match.group(0) if match else ""
 
 
-def normalize_key(key: str) -> str:
-    """Return a normalised key used for deduplication (店舗名+住所)."""
-    return normalize_text(key).lower()
+def extract_address(text: str) -> str:
+    """Attempt to extract an address from arbitrary text.
 
-
-def extract_phone(text: str) -> Optional[str]:
-    """Extract a Japanese phone number from the given text using regex.
-
-    Matches patterns such as 03-1234-5678, 090-1234-5678, 0120-123-456 etc.
-    Returns only the first match.
+    This function splits the text into lines and returns the first line
+    containing common Japanese address components such as '県', '府',
+    '市', '区', '町' or '村'.  If none of these tokens are present
+    the function returns an empty string.
     """
-    phone_regex = re.compile(r"(0\d{1,4}-\d{1,4}-\d{3,4})")
-    match = phone_regex.search(text)
-    return match.group(1) if match else None
+    if not text:
+        return ""
+    lines = text.splitlines()
+    for line in lines:
+        stripped = line.strip()
+        if any(tok in stripped for tok in ["県", "府", "市", "区", "町", "村"]):
+            return stripped
+    return ""
 
 
-def extract_address(text: str) -> Optional[str]:
-    """Attempt to extract an address from free text.
+def extract_hours(text: str) -> str:
+    """Attempt to extract opening hours from text.
 
-    The implementation looks for typical Japanese prefecture/city markers
-    followed by two or more characters.  This is heuristic and may need
-    tuning depending on the input.
+    The function looks for lines containing the character '時' which is
+    often present in Japanese time ranges.  If multiple lines match
+    the first is returned.
     """
-    # Prefecture names (partial list) for simple heuristics
-    prefectures = [
-        "北海道", "青森県", "岩手県", "宮城県", "秋田県", "山形県", "福島県", "茨城県", "栃木県", "群馬県",
-        "埼玉県", "千葉県", "東京都", "神奈川県", "新潟県", "富山県", "石川県", "福井県", "山梨県", "長野県",
-        "岐阜県", "静岡県", "愛知県", "三重県", "滋賀県", "京都府", "大阪府", "兵庫県", "奈良県", "和歌山県",
-        "鳥取県", "島根県", "岡山県", "広島県", "山口県", "徳島県", "香川県", "愛媛県", "高知県", "福岡県",
-        "佐賀県", "長崎県", "熊本県", "大分県", "宮崎県", "鹿児島県", "沖縄県",
-    ]
-    for pref in prefectures:
-        idx = text.find(pref)
-        if idx != -1:
-            # Return substring starting at prefecture and spanning until line break
-            remaining = text[idx:]
-            lines = remaining.split("\n")
-            if lines:
-                line = lines[0].strip()
-                # Basic sanity check: ensure it contains a number
-                if re.search(r"\d", line):
-                    return line
+    if not text:
+        return ""
+    for line in text.splitlines():
+        if "時" in line or "AM" in line.upper() or "PM" in line.upper():
+            return line.strip()
+    return ""
+
+
+def parse_coords_from_url(url: str) -> Optional[Tuple[float, float]]:
+    """Parse latitude and longitude from a URL.
+
+    Many mapping services encode the map centre or selected location
+    coordinates in the URL as `@lat,lng` or `ll=lat,lng`.  This
+    function decodes percent‑encoded characters and searches for
+    patterns matching these formats.  If no coordinates are found
+    `None` is returned.
+    """
+    if not url:
+        return None
+    # Unquote percent encoded parts and normalise the separator
+    decoded = urllib.parse.unquote(url)
+    # Normalise stray spaces around the @ symbol
+    decoded = decoded.replace("@ ", "@").replace(" @", "@")
+    # Pattern 1: @lat,lng
+    m = re.search(r"@(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)", decoded)
+    if m:
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except ValueError:
+            pass
+    # Pattern 2: ll=lat,lng or q=lat,lng
+    m = re.search(r"(?:ll|q)=(-?\d+(?:\.\d+)?),(-?\d+(?:\.\d+)?)", decoded)
+    if m:
+        try:
+            return float(m.group(1)), float(m.group(2))
+        except ValueError:
+            pass
     return None
 
 
-def extract_hours(text: str) -> Optional[str]:
-    """Extract opening hours from free text.
-
-    Looks for patterns like '10:00〜22:00', '9:00-19:30', etc.  Returns the
-    first occurrence.
-    """
-    hours_regex = re.compile(r"(\d{1,2}:\d{2}\s*[〜\-]\s*\d{1,2}:\d{2})")
-    match = hours_regex.search(text)
-    return match.group(1) if match else None
-
-
 def haversine_distance(lat1: float, lon1: float, lat2: float, lon2: float) -> Tuple[float, float]:
-    """Calculate the great circle distance between two points on Earth (haversine).
+    """Compute the great circle distance between two points.
 
-    Parameters
-    ----------
-    lat1, lon1 : float
-        Latitude and longitude of the first point in decimal degrees.
-    lat2, lon2 : float
-        Latitude and longitude of the second point in decimal degrees.
-
-    Returns
-    -------
-    Tuple[float, float]
-        Distance in metres and kilometres.
+    The haversine formula is used to calculate the distance on the
+    Earth's surface given two latitude/longitude pairs.  The function
+    returns the distance in metres and kilometres.  If any of the
+    inputs are NaN a distance of 0 is returned.
     """
-    # Radius of the Earth in metres
-    R = 6371000.0
-    phi1 = math.radians(lat1)
-    phi2 = math.radians(lat2)
-    d_phi = math.radians(lat2 - lat1)
-    d_lambda = math.radians(lon2 - lon1)
+    # Convert degrees to radians
+    try:
+        phi1, phi2 = math.radians(lat1), math.radians(lat2)
+        dphi = phi2 - phi1
+        dlambda = math.radians(lon2 - lon1)
+        a = math.sin(dphi / 2)**2 + math.cos(phi1) * math.cos(phi2) * math.sin(dlambda / 2)**2
+        c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+        distance_m = 6371000.0 * c
+        distance_km = distance_m / 1000.0
+        return distance_m, distance_km
+    except Exception:
+        return 0.0, 0.0
 
-    a = math.sin(d_phi / 2) ** 2 + math.cos(phi1) * math.cos(phi2) * math.sin(d_lambda / 2) ** 2
-    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-    distance_m = R * c
-    distance_km = distance_m / 1000.0
-    return round(distance_m, 3), round(distance_km, 3)
+
+def unique_by_name_address(rows: Iterable[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Deduplicate a list of result dictionaries by store name and address.
+
+    Because ロケスマ can display the same facility multiple times when
+    searching different categories or when markers overlap, the key
+    `(店舗名, 住所)` is used to identify duplicates.  The first
+    occurrence of a given key is kept.
+    """
+    seen: set[Tuple[str, str]] = set()
+    unique_rows: List[Dict[str, Any]] = []
+    for row in rows:
+        key = (row.get("店舗名", ""), row.get("住所", ""))
+        if key not in seen:
+            seen.add(key)
+            unique_rows.append(row)
+    return unique_rows
