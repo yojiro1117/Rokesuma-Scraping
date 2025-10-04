@@ -1,63 +1,104 @@
-"""Selectors definitions for scraping the ロケスマ site.
+"""CSS selector definitions for scraping the ロケスマ web application.
 
-The site structure can vary across versions and categories.  To make the
-scraper robust against changes, the scraping logic iterates over lists of
-candidate selectors defined in this module.  When adding or updating
-selectors, keep the order from most specific to most general.  Only the
-first match per field is used.
+The ロケスマ site is built with a combination of the Leaflet and
+Google Maps libraries.  Markers and detail panels are constructed
+dynamically which means their structure can differ depending on the
+selected map type and view.  To make the scraper resilient the
+selectors defined here specify multiple candidates for each piece
+of information.  The scraping logic iterates through the lists in
+order until it finds a match.
+
+Should the site change in the future you can update these lists
+without modifying the main scraping code.  When adding selectors
+remember to put more specific selectors earlier in the list.
 """
 
-# Selectors for map markers.  These selectors should return a list of
-# elements corresponding to clickable markers on the map.  The list is
-# ordered as they appear in the DOM; scraping logic clicks markers in this
-# order.
+# Markers on the map.  These selectors should return a list of
+# elements corresponding to clickable markers.  Some maps use
+# Leaflet markers (`div.leaflet-marker-icon`), others use Google
+# Maps markers (`div.gmoprint img`).
 MARKER_SELECTORS = [
     "div.leaflet-marker-icon",
     "img.leaflet-marker-icon",
-    "div.gmnoprint img",        # Google Maps style markers
     "div.gmnoprint",
+    "div.gmoprint img",
+    "div.gm-style-iw div[role='button']"
 ]
 
-# Candidate selectors for the store name in the detail panel or popup.
-# Many elements on the site display the name as a heading.  Adjust these
-# selectors as necessary when the site layout evolves.
+# Candidate selectors for the store name displayed in the detail panel
+# or popup.  These selectors are tried in order.
 STORE_NAME_SELECTORS = [
+    "div#storePanel h2",
+    "div#storePanel h1",
     "div.storePanel h2",
     "div.storePanel h1",
-    "div.place-name",
-    ".place-name",
-    "h1",
-    "h2",
+    "div#detailPanel h2",
+    "div#detailPanel h1",
+    "div.leaflet-popup-content h2",
+    "div.leaflet-popup-content h1"
 ]
 
-# Candidate selectors for the address field.  The address is often
-# presented with a label (e.g. "住所" or "所在地").  Where CSS labels are
-# unreliable this list can be extended with XPath expressions.
+# Candidate selectors for the address field.
 ADDRESS_SELECTORS = [
-    "div:has-text('住所') + div",
-    "div:has-text('所在地') + div",
-    "span.address",
-    ".address",
-    ".address-wrap",
+    "div#storePanel .addr",
+    "div.storePanel .addr",
+    "div#storePanel p",
+    "div.storePanel p",
+    "div#detailPanel .addr",
+    "div.leaflet-popup-content p"
 ]
 
-# Candidate selectors for the phone number.  A tel link is the preferred
-# method of extraction because it provides clean digits.  If the site
-# removes tel links this list can be extended with additional selectors.
+# Candidate selectors for the phone number.
 PHONE_SELECTORS = [
-    "a[href^='tel']",
-    "a.js-phone-number",
-    ".phone-number",
-    "div:has-text('電話') span",
+    "div#storePanel .tel",
+    "div.storePanel .tel",
+    "div#detailPanel .tel",
+    "div#storePanel p:contains('電話')",
+    "div.storePanel p:contains('電話')"
 ]
 
-# Candidate selectors for opening hours.  Hours are often labelled
-# explicitly but may also appear within an unstructured blob of text.  The
-# scraper falls back to a regex if none of these selectors return text.
+# Candidate selectors for the opening hours.
 HOURS_SELECTORS = [
-    "div:has-text('営業時間') + div",
-    "div:has-text('時間') + div",
-    ".business-hours",
-    ".opening-hours",
-    "span.hours",
+    "div#storePanel .hour",
+    "div.storePanel .hour",
+    "div#detailPanel .hour",
+    "div.leaflet-popup-content .hour",
+    "div#storePanel p:contains('時間')",
+    "div.storePanel p:contains('時間')"
+]
+
+
+# A default list of categories to display in the Streamlit UI when
+# automatic retrieval of categories from the site fails.  These
+# represent common types of facilities users may wish to search for.
+DEFAULT_CATEGORIES = [
+    "コンビニ",
+    "カフェ",
+    "レストラン",
+    "バーガー",
+    "回転寿司/すし",
+    "ラーメン",
+    "牛丼",
+    "ファミレス",
+    "カレー",
+    "ファストフード",
+    "スイーツ",
+    "ベーカリー",
+    "居酒屋",
+    "焼肉",
+    "カラオケ",
+    "コインパーキング",
+    "ガソリンスタンド",
+    "銀行ATM",
+    "ドラッグストア",
+    "スーパー",
+    "ホームセンター",
+    "電気店",
+    "100円ショップ",
+    "ファッション",
+    "ホテル",
+    "病院・診療所",
+    "郵便局",
+    "図書館",
+    "スポーツクラブ"
 ]
