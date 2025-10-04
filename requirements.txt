@@ -1,7 +1,6 @@
-streamlit>=1.29
-playwright==1.42.0
-pandas>=1.5
-openpyxl>=3.1
-tenacity>=8.2
-numpy>=1.23
-pytest>=7.4
+streamlit>=1.30.0
+playwright>=1.40.0
+pandas>=1.5.0
+openpyxl>=3.1.2
+tenacity>=8.2.0
+numpy>=1.23.0
