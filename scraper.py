@@ -1,36 +1,32 @@
 """Scraping logic for the ロケスマ Streamlit application.
 
-This module encapsulates all browser automation using Playwright.  It exposes
-a single entry point `scrape_locations` which accepts search parameters,
-launches a Chromium instance (honouring the headless flag) and
-programmatically interacts with the ロケスマ web application.  The scraper
-clicks markers on the map one by one and collects structured information
-from the detail panel or popups.  Where a value cannot be extracted
-directly from a specific DOM element the implementation falls back to
-regular expressions applied to the full visible text.
-
-Because the structure of the ロケスマ site may evolve, selectors are
-centralised in the selectors.py module.  The scraper iterates over lists
-of candidate selectors until it finds a match for each field.  When new
-elements are introduced on the site updating selectors.py is usually
-sufficient without touching the scraping logic.
+This module encapsulates all browser automation using Playwright.  It
+exposes a single entry point `scrape_locations` which accepts search
+parameters, launches a Chromium instance (honouring the headless flag)
+and programmatically interacts with the ロケスマ web app.  For each
+selected category the scraper clicks markers on the map one by one and
+extracts structured information from the detail panel or popup.  Where
+a value cannot be extracted directly from a specific DOM element the
+implementation falls back to regular expressions applied to the full
+visible text or URL based heuristics.
 
 Errors and progress information are logged via the provided logger.  The
-calling code is responsible for configuring logging handlers.
+calling code is responsible for configuring logging handlers and
+presenting log messages to the user.
 """
 
-import re
-import time
+from __future__ import annotations
+
+import asyncio
 import datetime
-import os
+import logging
 from dataclasses import dataclass
-from typing import List, Dict, Tuple, Optional
+from typing import List, Optional, Dict, Tuple, Any, Iterable
 
 import pandas as pd
-import numpy as np
-from tenacity import retry, stop_after_attempt, wait_fixed
 
-from playwright.sync_api import sync_playwright, Page, TimeoutError as PlaywrightTimeoutError
+from tenacity import retry, stop_after_attempt, wait_fixed
+from playwright.async_api import async_playwright
 
 from selectors import (
     MARKER_SELECTORS,
@@ -38,13 +34,15 @@ from selectors import (
     ADDRESS_SELECTORS,
     PHONE_SELECTORS,
     HOURS_SELECTORS,
+    DEFAULT_CATEGORIES,
 )
 from utils import (
     extract_phone,
     extract_address,
     extract_hours,
+    parse_coords_from_url,
     haversine_distance,
-    normalize_key,
+    unique_by_name_address,
 )
 
 
@@ -54,445 +52,325 @@ class ScrapeResult:
 
     Attributes
     ----------
-    dataframe : pandme
+    dataframe : pd.DataFrame
         The DataFrame of extracted location information.
     log_lines : List[str]
-        The list of log messages captured during the scrape.
+        The list of log messages captured during the scrape.  Each
+        message is prefixed with a timestamp to aid debugging.
     """
 
     dataframe: pd.DataFrame
     log_lines: List[str]
 
 
-def append_log(logs: List[str], message: str) -> None:
-    """Append a message to the in-memory log list with timestamp."""
-    ts = datetime.datetime.now().strftime("%H:%M:%S")
-    logs.append(f"{ts} {message}")
+async def _scrape_async(
+    address: str,
+    zoom: int,
+    categories: Optional[List[str]],
+    headless: bool,
+    max_count: Optional[int],
+    logger: logging.Logger,
+) -> ScrapeResult:
+    """Asynchronous core scraping routine.
 
-
-def safe_get_text(page: Page, selectors: List[str], logger, logs: List[str]) -> Optional[str]:
-    """Try a series of selectors and return the first non-empty text.
-
-    Parameters
-    ----------
-    page : playwright.sync_api.Page
-        The current page.
-    selectors : List[str]
-        Candidate selectors to try.
-    logger : logging.Logger
-        Logger for debug messages.
-    logs : List[str]
-        In-memory log lines to update.
-
-    Returns
-    -------
-    Optional[str]
-        The text content if found, otherwise None.
+    This function is intended to be executed inside an asyncio event
+    loop.  It performs all browser automation using Playwright's
+    asynchronous API.  A synchronous wrapper is provided by
+    `scrape_locations` which invokes this coroutine via
+    `asyncio.run()`.
     """
-    for sel in selectors:
-        try:
-            element = page.query_selector(sel)
-            if element:
-                text = element.inner_text().strip()
-                if text:
-                    logger.info(f"Found text for selector '{sel}': {text}")
-                    append_log(logs, f"selector '{sel}' -> '{text}'")
-                    return text
-        except PlaywrightTimeoutError:
-            continue
-        except Exception:
-            continue
-    return None
+    logs: List[str] = []
 
+    def append_log(message: str) -> None:
+        """Helper to record a log line with timestamp."""
+        ts = datetime.datetime.now().strftime("%H:%M:%S")
+        entry = f"[{ts}] {message}"
+        logs.append(entry)
+        if logger:
+            logger.info(message)
 
-def parse_detail_panel(page: Page, logger, logs: List[str], origin_lat: float, origin_lng: float) -> Dict[str, object]:
-    """Extract store information from the detail panel or popup.
+    # Use provided categories or fall back to default
+    category_list = categories or []
+    if not category_list:
+        category_list = DEFAULT_CATEGORIES
 
-    This method reads visible text and attributes from the page to build a
-    dictionary of values.  It uses multiple selectors for robustness and
-    fas.DataFra
-alls back to regular expression based extraction where necessary.
+    # Keep track of the origin coordinates after searching the centre
+    origin_lat: Optional[float] = None
+    origin_lng: Optional[float] = None
 
-    Parameters
-    ----------
-    page : playwright.sync_api.Page
-        The page instance.
-    logger : logging.Logger
-        Logger to record progress.
-    logs : List[str]
-        In-memory log lines.
-    origin_lat : float
-        Latitude of the search centre for distance calculations.
-    origin_lng : float
-        Longitude of the search centre for distance calculations.
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        context = await browser.new_context()
+        page = await context.new_page()
 
-    Returns
-    -------
-    Dict[str, object]
-        A dictionary containing extracted fields.
-    """
-    data: Dict[str, object] = {}
+        # Visit ロケスマ
+        await page.goto("https://www.locationsmart.org/", timeout=60000)
+        append_log("Loaded ロケスマWEB")
 
-    # Obtain the full visible text from the detail panel for regex fallback
-    full_text = ""
-    try:
-        full_text = page.inner_text("body")  # fallback to whole page
-    except Exception:
-        full_text = ""
-
-    # Store name
-    name = safe_get_text(page, STORE_NAME_SELECTORS, logger, logs)
-    if not name:
-        # fallback: first line of full_text
-        first_line = full_text.strip().split("\n")[0] if full_text else ""
-        name = first_line[:100] if first_line else ""
-        logger.warning(f"Store name fallback used: {name}")
-        append_log(logs, f"Name fallback used: {name}")
-    data["店舗名"] = name
-
-    # Phone number
-    phone = safe_get_text(page, PHONE_SELECTORS, logger, logs)
-    if not phone and full_text:
-        phone = extract_phone(full_text)
-        if phone:
-            logger.info(f"Phone extracted via regex: {phone}")
-            append_log(logs, f"Phone via regex: {phone}")
-    data["電話番号"] = phone if phone else ""
-
-    # Address
-    address = safe_get_text(page, ADDRESS_SELECTORS, logger, logs)
-    if not address and full_text:
-        address = extract_address(full_text)
-        if address:
-            logger.info(f"Adess}")
-            append_log(logs, f"Address via regex: {address}")
-    data["住所"] = address if address else ""
-
-    # Opening hours
-    hours = safe_get_text(page, HOURS_SELECTORS, logger, logs)
-    if not hours and full_text:
-        hours = extract_hours(full_text)
-        if hours:
-            logger.info(f"Hours extracted via regex: {hours}")
-            append_log(logs, f"Hours via regex: {hours}")
-    data["営業時間"] = hours if hours else ""
-
-    # Coordinates: attempt to pull from marker attributes or URL
-    lat, lng = None, None
-    # Try reading attributes from visible elements
-    for attr_selector in [
-        "div.leaflet-marker-icon",  # Leaflet default icon
-        "img.leaflet-marker-icon",
-        "div.gm-style-iw-d > a[href*=\\@]",  # Google style info window links containing @lat,lng
-    ]:
-        try:
-            elem = page.query_selector(attr_selector)
-            if elem:
-                data_lat = elem.get_attribute("data-lat")
-                data_lng = elem.get_attribute("data-lng")
-                if data_lat and data_lng:
-                    lat = float(data_lat)
-                    lng = float(data_lng)
-                    logger.info(f"Coordinates from marker attributes: {lat}, {lng}")
-                    append_log(logs, f"Coords from attrs: {lat}, {lng}")
+        # Locate the map search input.  The input used for address
+        # searching is reused for chain searches as well.  We try a
+        # handful of selectors to improve resilience.
+        search_selectors = [
+            "input[placeholder*='住所']",
+            "input[aria-label*='検索']",
+            "input[type='search']",
+            "input[type='text']"
+        ]
+        search_input = None
+        for sel in search_selectors:
+            try:
+                element = await page.query_selector(sel)
+                if element:
+                    search_input = element
                     break
-        except Exception:
-            continue
-    # If still not found, attempt to parse from URL (@lat,lng,zoom)
-    if lat is None or lng is None:
-        url = page.url
-        match = re.search(r"@([-\d\.]+),([-\d\.]+)", url)
-        if match:
-            lat = float(match.group(1))
-            lng = float(match.group(2))
-            logger.info(f"Coordinates from URL: {lat}, {lng}")
-            append_log(logs, f"Coords from URL: {lat}, {lng}")
-    # If stdress extractedill not found, use page.evaluate to ask map centre
-    if lat is None or lng is None:
-        try:
-            lat = page.evaluate("window.map && map.getCenter ? map.getCenter().lat : null")
-            lng = page.evaluate("window.map && map.getCenter ? map.getCenter().lng : null")
-            if lat is not None and lng is not None:
-                lat, lng = float(lat), float(lng)
-                logger.info(f"Coordinates from map centre: {lat}, {lng}")
-                append_log(logs, f"Coords from centre: {lat}, {lng}")
-        except Exception:
-            lat = None
-            lng = None
+            except Exception:
+                continue
 
-    data["緯度"] = lat if lat is not None else np.nan
-    data["経度"] = lng if lng is not None else np.nan
+        # If a search input is found, enter the centre address to
+        # reposition the map.  This improves the relevance of the
+        # results when the user searches over a wide area.  A best
+        # effort is made; errors are logged but not fatal.
+        if search_input:
+            try:
+                await search_input.fill(address)
+                await search_input.press("Enter")
+                append_log(f"Searched for centre address: {address}")
+                # Give the map a moment to update
+                await page.wait_for_timeout(2000)
+                origin_coords = parse_coords_from_url(page.url)
+                if origin_coords:
+                    origin_lat, origin_lng = origin_coords
+                    append_log(f"Origin coordinates resolved from URL: {origin_lat}, {origin_lng}")
+            except Exception as e:
+                append_log(f"Failed to search centre address: {e}")
+        else:
+            append_log("Search input not found; proceeding without setting centre address")
 
-    # Distance calculation (if coordinates are available)
-    if lat is not None and lng is not None and origin_lat is not None and origin_lng is not None:
-        dist_m, dist_km = haversine_distance(origin_lat, origin_lng, lat, lng)
-        data["距離_m"] = dist_m
-        data["距離_km"] = dist_km
-    else:
-        data["距離_m"] = np.nan
-        data["距離_km"] = np.nan
+        all_rows: List[Dict[str, Any]] = []
 
-    return data
+        # Iterate through the selected categories.  The ロケスマ search
+        # input accepts both chain names and broader categories; after
+        # entering the value and confirming we expect the map to
+        # populate with markers corresponding to the selected category.
+        for cat in category_list:
+            # Clear the search input before typing a new category
+            if search_input:
+                try:
+                    await search_input.fill("")
+                    await search_input.type(cat)
+                    await search_input.press("Enter")
+                    append_log(f"Selected category: {cat}")
+                    # Allow time for markers to load
+                    await page.wait_for_timeout(2000)
+                except Exception as e:
+                    append_log(f"Failed to search category '{cat}': {e}")
 
+            # Locate markers on the map.  Try each selector until we
+            # find at least one candidate.  If none are found we log
+            # and continue with the next category.
+            marker_elements: List[Any] = []
+            for msel in MARKER_SELECTORS:
+                try:
+                    elements = await page.query_selector_all(msel)
+                    if elements:
+                        marker_elements = elements
+                        break
+                except Exception:
+                    continue
+            if not marker_elements:
+                append_log(f"No markers found for category '{cat}'")
+                continue
 
-def extract_origin_coords(page: Page, logger, logs: List[str]) -> Tuple[Optional[float], Optional[float]]:
-    """Attempt to determine the latitude and longitude of the map centre.
+            # Iterate over the markers.  For each marker click it,
+            # extract details and append to the result list.  Respect
+            # the max_count limit if provided.
+            processed = 0
+            for marker in marker_elements:
+                if max_count and processed >= max_count:
+                    break
+                try:
+                    await marker.click()
+                    # Wait a short while for the detail panel or popup
+                    await page.wait_for_timeout(800)
 
-    The centre coordinates are used as the baseline for distance calculations.
+                    # Grab the entire visible text as a fallback
+                    try:
+                        full_text = await page.inner_text("body")
+                    except Exception:
+                        full_text = ""
 
-    Returns
-    -------
-    Tuple[Optional[float], Optional[float]]
-        (latitude, longitude) or (None, None) if unavailable.
-    """
-    # Try from URL first
-    url = page.url
-    match = re.search(r"@([-\d\.]+),([-\d\.]+)", url)
-    if match:
-        try:
-            return float(match.group(1)), float(match.group(2))
-        except Exception:
-            pass
-    # Fallback to map centre via JS
-    try:
-        lat = page.evaluate(" via regwindow.map && map.getCenter ? map.getCenter().lat : null")
-        lng = page.evaluate("window.map && map.getCenter ? map.getCenter().lng : null")
-        if lat is not None and lng is not None:
-            return float(lat), float(lng)
-    except Exception:
-        return None, None
-    return None, None
+                    # Extract store name
+                    name: str = ""
+                    for sel in STORE_NAME_SELECTORS:
+                        try:
+                            elem = await page.query_selector(sel)
+                            if elem:
+                                text = (await elem.inner_text()).strip()
+                                if text:
+                                    name = text
+                                    break
+                        except Exception:
+                            continue
 
+                    # Extract address
+                    address_text: str = ""
+                    for sel in ADDRESS_SELECTORS:
+                        try:
+                            elem = await page.query_selector(sel)
+                            if elem:
+                                text = (await elem.inner_text()).strip()
+                                if text:
+                                    address_text = text
+                                    break
+                        except Exception:
+                            continue
+                    if not address_text:
+                        address_text = extract_address(full_text)
 
-def locate_and_click_marker(page: Page, idx: int, logger, logs: List[str]) -> bool:
-    """Locate the marker by index and click it.
+                    # Extract phone
+                    phone_text: str = ""
+                    for sel in PHONE_SELECTORS:
+                        try:
+                            elem = await page.query_selector(sel)
+                            if elem:
+                                text = (await elem.inner_text()).strip()
+                                if text:
+                                    phone_text = text
+                                    break
+                        except Exception:
+                            continue
+                    phone = extract_phone(phone_text or full_text)
 
-    Returns True if the click appears to succeed, False otherwise.  The
-    function iterates through MARKER_SELECTORS from selectors.py and
-    attempts to fetch the list of marker elements.  If the requested
-    index does not exist it returns False.
-    """
-    for sel in MARKER_SELECTORS:
-        try:
-            markers = page.query_selector_all(sel)
-            if markers and len(markers) > idx:
-                logger.info(f"Clicking marker #{idx} using selector {sel}")
-                append_log(logs, f"Click marker {idx} using {sel}")
-                markers[idx].click()
-                return True
-        except Exception:
-            continue
-    return False
+                    # Extract hours
+                    hours_text: str = ""
+                    for sel in HOURS_SELECTORS:
+                        try:
+                            elem = await page.query_selector(sel)
+                            if elem:
+                                text = (await elem.inner_text()).strip()
+                                if text:
+                                    hours_text = text
+                                    break
+                        except Exception:
+                            continue
+                    hours = extract_hours(hours_text or full_text)
+
+                    # Attempt to resolve coordinates.  Start by
+                    # inspecting marker attributes for latitude and
+                    # longitude values.
+                    lat: Optional[float] = None
+                    lng: Optional[float] = None
+                    try:
+                        attr_lat = await marker.get_attribute("data-lat")
+                        attr_lng = await marker.get_attribute("data-lng") or await marker.get_attribute("data-lon")
+                        if attr_lat and attr_lng:
+                            lat = float(attr_lat)
+                            lng = float(attr_lng)
+                    except Exception:
+                        pass
+                    # Fallback 1: parse from the URL
+                    if lat is None or lng is None:
+                        coords = parse_coords_from_url(page.url)
+                        if coords:
+                            lat, lng = coords
+                    # Fallback 2: use map centre
+                    if lat is None or lng is None:
+                        try:
+                            centre = await page.evaluate("(window.map && window.map.getCenter) ? [map.getCenter().lat, map.getCenter().lng] : null")
+                            if centre:
+                                lat, lng = float(centre[0]), float(centre[1])
+                                append_log("Using map centre as coordinate fallback")
+                        except Exception:
+                            pass
+
+                    # Compute distance from origin if possible
+                    dist_m: Optional[float] = None
+                    dist_km: Optional[float] = None
+                    if lat is not None and lng is not None and origin_lat is not None and origin_lng is not None:
+                        dm, dk = haversine_distance(origin_lat, origin_lng, lat, lng)
+                        dist_m = round(dm, 2)
+                        dist_km = round(dk, 3)
+
+                    row = {
+                        "店舗名": name,
+                        "電話番号": phone,
+                        "住所": address_text,
+                        "営業時間": hours,
+                        "緯度": lat,
+                        "経度": lng,
+                        "距離_m": dist_m,
+                        "距離_km": dist_km,
+                        "カテゴリ": cat,
+                        "取得時刻": datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    }
+                    all_rows.append(row)
+                    processed += 1
+                except Exception as e:
+                    append_log(f"Error processing marker: {e}")
+            append_log(f"Processed {processed} markers for category '{cat}'")
+
+        # Close browser
+        await browser.close()
+
+    # Deduplicate results by name and address
+    unique_rows = unique_by_name_address(all_rows)
+    df = pd.DataFrame(unique_rows)
+    return ScrapeResult(dataframe=df, log_lines=logs)
 
 
 def scrape_locations(
     address: str,
-    zoom: int,
-    categories: List[str],
-    headless: bool,
-    max_items: int,
-    logger,
+    zoom: int = 13,
+    categories: Optional[List[str]] = None,
+    headless: bool = True,
+    max_count: Optional[int] = None,
+    logger: Optional[logging.Logger] = None,
 ) -> ScrapeResult:
-    """High level scraping function.
+    """Synchronously scrape locations from ロケスマ.
 
     Parameters
     ----------
     address : str
-        The central address to search around.
-    zoom : int
-        Zoom level for the map (8‑18).
-    categories : List[str]
-        Categories of stores to search.  The special category "病院・診療所" is
-        handled via the search bar because it may not appear in the panel.
-    headless : bool
-        If True, launch the browser in headless mode.
-    max_items : int
-        Maximum number of items tomit).
-    logger : logging.Logger
-        A logger configured by the caller.
+        Centre address used to focus the map before extracting data.
+    zoom : int, optional
+        Initial zoom level (currently unused but reserved for future
+        enhancements), by default 13.
+    categories : list of str, optional
+        One or more category names to search.  If omitted the default
+        category list from ``selectors.DEFAULT_CATEGORIES`` is used.
+    headless : bool, optional
+        Whether to run the browser in headless mode, by default True.
+    max_count : int, optional
+        Maximum number of markers to process per category.  Use 0 or
+        ``None`` to process all markers.
+    logger : logging.Logger, optional
+        Logger instance for recording progress messages.  If None
+        messages are stored in the returned log lines but not emitted
+        elsewhere.
 
     Returns
     -------
     ScrapeResult
-        Contains the resulting DataFrame and a list of log lines.
+        Object containing a pandas DataFrame with the extracted data
+        and a list of log lines.
     """
-    # Accumulate logs in memory for display in the UI
-    logs: List[str] = []
+    # Normalise max_count: treat 0 or negative as unlimited
+    max_count_norm: Optional[int] = None
+    if max_count:
+        try:
+            mc = int(max_count)
+            if mc > 0:
+                max_count_norm = mc
+        except Exception:
+            pass
 
-    append_log(logs, "Playwright session starting")
-    # Set browser path environment variable to ensure bundled browsers are used
-    os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", os.path.join(os.path.dirname(__file__), "ms-playwright"))
-
-    data_records: List[Dict[str, object]] = []
-    try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless, args=["--disable-infobars", "--start-maximized"])
-            context = browser.new_context()
-            page = context.new_page()
-            base_url = "https://www.locationsmart.org"  # Web version of ロケスマ
-            logger.info(f"Navigating to {base_url}")
-            append_log(logs, f"Navigate to {base_url}")
-            page.goto(base_url, wait_until="domcontentloaded")
-
-            # Accept any cookie or terms dialogs if present
-            try:
-                page.click("text=同意", timeout=3000)
-                append_log(logs, "Clicked consent button")
-            except Exception:
-                pass
-
-            # Input the address in the search box
-            try:
-                search_box = page.wait_for_selector("input[type=text]", timeout=10000)
-                search_box.click()
-                search_box.fill(address)
-                search_box.press("Enter")
-                append_log(logs, f"Search for address: {address}")
-            except PlaywrightTimeoutError:
-                append_log(logs, "Search box not found; cannot proceed")
-                logger.error("Search box not f
-                return ScrapeResult(pd.DataFrame(), logs)
-
-            # Wait for map to load results
-            page.wait_for_timeout(5000)
-
-            # Adjust zoom if necessary by interacting with the map controls
-            try:
-                current_zoom = page.evaluate("window.map && map.getZoom ? map.getZoom() : null")
-                if current_zoom is not None:
-                    while int(current_zoom) < zoom:
-                        page.click("button[aria-label='Zoom in']", timeout=2000)
-                        current_zoom = page.evaluate("map.getZoom()")
-                        page.wait_for_timeout(500)
-                    while int(current_zoom) > zoom:
-                        page.click("button[aria-label='Zoom out']", timeout=2000)
-                        current_zoom = page.evaluate("map.getZoom()")
-                        page.wait_for_timeout(500)
-                append_log(logs, f"Adjusted zoom to {zoom}")
-            except Exception:
-                logger.info("Zoom controls not found; skipping zoom adjustment")
-                append_log(logs, "Zoom adjustment skipped")
-
-            # Determine centre coordinates for distance calculations
-            origin_lat, origin_lng = extract_origin_coords(page, logger, logs)
-
-            # For each selected category, apply filters or search
-            for cat in categories:
-                append_log(logs, f"Processing category: {cat}")
-                logger.info(f"Processing category: {cat}")
-
-                # Special handling for 病院・診療所
-                if cat == "病院・診療所":
-                    # Use search bar for this category
-                    try:
-                        search_box = page.query_selector("input[type=text]")
-                        if search_box:
-                           ound") extract (0 or negativ search_box.click()
-                            search_box.fill(cat)
-                            search_box.press("Enter")
-                            append_log(logs, f"Searched for special category: {cat}")
-                            page.wait_for_timeout(3000)
-                    except Exception:
-                        logger.warning(f"Failed to perform search for special category: {cat}")
-                        append_log(logs, f"Search failed for {cat}")
-                else:
-                    # Try clicking category button in panel; fallback to search bar
-                    clicked = False
-                    for sel in [f"text='{cat}'", f"button:has-text('{cat}')", f"[role=button]:has-text('{cat}')"]:
-                        try:
-                            element = page.query_selector(sel)
-                            if element:
-                                element.click()
-                                clicked = True
-                                append_log(logs, f"Clicked category button {cat}")
-                                page.wait_for_timeout(2000)
-                                break
-                        except Exception:
-                            continue
-                    if not clicked:
-                        # fallback to search bar
-                        try:
-                            search_box = page.query_selector("input[type=text]")
-                            if search_box:
-                                search_box.click()
-                                search_box.fill(cat)
-                                search_box.press("Enter")
-                                append_log(logs, f"Searched for category via search: {cat}")
-                                page.wait_for_timeout(3000)
-                        ption:
-                            append_log(logs, f"Failed to search for category {cat}")
-
-                # Wait briefly for markers to refresh
-                page.wait_for_timeout(2000)
-
-                # Get markers count to iterate through
-                marker_count = 0
-                for sel in MARKER_SELECTORS:
-                    try:
-                        markers = page.query_selector_all(sel)
-                        if markers:
-                            marker_count = len(markers)
-                            break
-                    except Exception:
-                        continue
-                append_log(logs, f"Found {marker_count} markers for category {cat}")
-                logger.info(f"Found {marker_count} markers for category {cat}")
-                # If no markers found, try to scroll or zoom slightly to provoke loading
-                if marker_count == 0:
-                    page.mouse.wheel(0, 200)  # Scroll down
-                    page.wait_for_timeout(2000)
-                    for sel in MARKER_SELECTORS:
-                        markers = page.query_selector_all(sel)
-                        if markers:
-                            marker_count = len(markers)
-                            append_log(logs, f"After scrolling, markers = {marker_count}")
-                            break
-
-                # Iterate over markers
-                for idx in range(marker_count):
-                    # Respect maximum items
-                    if max_items and len(data_records) >= max_items:
-                        append_log(logs, f"Reached maximum of {max_items} items, stopping.")
-                        break
-                    success = locate_and_click_marker(page, idx, logger, logs)
-                    if not success:
-except E  append_log(logs, f"Failed to click marker {idx} for category {cat}")
-                        continue
-                    # Wait for detail panel to appear
-                    page.wait_for_timeout(1000)
-                    try:
-                        record = parse_detail_panel(page, logger, logs, origin_lat, origin_lng)
-                        record["カテゴリ"] = cat
-                        record["取得時刻"] = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-                        data_records.append(record)
-                        append_log(logs, f"Extracted record for marker {idx}: {record['店舗名']}")
-                    except Exception as e:
-                        logger.warning(f"Error parsing marker {idx}: {e}")
-                        append_log(logs, f"Error parsing marker {idx}: {e}")
-                        continue
-
-                # If maximum reached, break outer loop
-                if max_items and len(data_records) >= max_items:
-                    break
-
-        # End of Playwright context
-    except Exception as exc:
-        logger.exception("Scraping failed with exception")
-        append_log(logs, f"Scraping failed: {exc}")
-        return ScrapeResult(pd.DataFrame(), logs)
-
-    # Construct DataFrame
-    if data_records:
-        df = pd.DataFrame(data_records)
-    else:
-        df = pd.DataFrame(columns=["店舗名", "電話番号", "住所", "営業時間", "緯度", "経度", "距離_m", "距離_km", "カテゴリ", "取得時刻"])
-
-    # Deduplicate on key (店舗名＋住所)
-    if not df.empty:
-        df["_key"] = df["店舗名"].fillna("").astype(str) + df["住所"].fillna("").astype(str)
-        df["_key_norm"] = df["_key"].apply(normalize_key)
-        df = df.drop_duplicates(subset="_key_norm")
-        df = df.drop(columns=["_key", "_key_norm"])
-
-    return ScrapeResult(df, logs)
-xcee means no liex: {addr
+    return asyncio.run(
+        _scrape_async(
+            address=address,
+            zoom=zoom,
+            categories=categories,
+            headless=headless,
+            max_count=max_count_norm,
+            logger=logger or logging.getLogger(__name__),
+        )
+    )
