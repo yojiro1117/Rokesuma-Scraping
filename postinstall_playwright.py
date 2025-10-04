@@ -1,18 +1,15 @@
-"""Post installation script to fetch Playwright browser binaries.
+"""Post-installation script for Playwright.
 
-Running this script will download the Chromium browser required by
-Playwright into the local project directory.  It honours the
-PLAYWRIGHT_BROWSERS_PATH environment variable which is set to
-`./ms-playwright` by default in run scripts.  Without running this
-installation step the scraper will fail to launch a browser.
+This script is executed after the dependencies are installed on Streamlit Cloud.
+It ensures that the Chromium browser used by Playwright is downloaded into
+a local directory under the project root rather than the default global
+location. Storing the browser in the repository folder avoids issues with
+read‑only filesystems in the cloud environment.
 
-Usage
------
-    python postinstall_playwright.py
-
-If the download fails due to network issues, re-run the script once
-connectivity has been restored.  The script is idempotent: if the
-browsers are already present no action is taken.
+The environment variable `PLAYWRIGHT_BROWSERS_PATH` is set to `./ms-playwright`
+by Streamlit Cloud during deployment. When this variable is defined Playwright
+will download its browser bundles into the specified directory instead of
+`~/.cache/playwright`.
 """
 
 import os
@@ -20,21 +17,30 @@ import subprocess
 import sys
 
 
-
 def main() -> None:
-    # Determine the path where browsers will be stored
-    browsers_path = os.environ.get(
-        "PLAYWRIGHT_BROWSERS_PATH", os.path.join(os.path.dirname(__file__), "ms-playwright")
-    )
-    os.environ["PLAYWRIGHT_BROWSERS_PATH"] = browsers_path
-    print(f"Installing Playwright browsers into {browsers_path}…")
+    """Install the Chromium browser for Playwright.
+
+    On Streamlit Cloud the network may be unreliable or slow; running the
+    installation command in a separate process allows retrying if needed.
+    """
+    # Determine the target directory for Playwright browsers.  This mirrors
+    # the setting used in `.streamlit/config.toml` for the `PLAYWRIGHT_BROWSERS_PATH`.
+    browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "./ms-playwright")
+    os.makedirs(browsers_path, exist_ok=True)
+
+    # Run the install command.  This downloads the Chromium browser package.
     try:
-        subprocess.check_call([sys.executable, "-m", "playwright", "install", "chromium"])
-        print("Playwright installation completed successfully.")
-    except subprocess.CalledProcessError as exc:
-        print("Playwright installation failed.")
-        print(exc)
-        sys.exit(exc.returncode)
+        subprocess.run([
+            sys.executable,
+            "-m",
+            "playwright",
+            "install",
+            "chromium",
+        ], check=True)
+    except Exception as exc:
+        # If installation fails we surface the error; Streamlit Cloud logs will
+        # capture the exception and alert the user to the problem.
+        raise RuntimeError("Failed to install Playwright browsers") from exc
 
 
 if __name__ == "__main__":
