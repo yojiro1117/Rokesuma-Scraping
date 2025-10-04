@@ -1,0 +1,15 @@
+"""
+Streamlit configuration for the Rokesuma scraping application.
+
+This configuration file tweaks the server settings for deployment on
+Streamlit Cloud.  The `headless` flag is set to true so that no
+GUI window is opened in the container and CORS is disabled to
+simplify embedding.  A fixed port is specified to allow the smoke
+tests to connect to the app reliably during CI runs.
+"""
+
+[server]
+headless = true
+enableCORS = false
+port = 8501
+enableXsrfProtection = true
