@@ -28,7 +28,7 @@ import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_fixed
 from playwright.async_api import async_playwright
 
-from selectors import (
+from selectors_def import (
     MARKER_SELECTORS,
     STORE_NAME_SELECTORS,
     ADDRESS_SELECTORS,
