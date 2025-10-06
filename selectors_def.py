@@ -34,7 +34,9 @@ STORE_NAME_SELECTORS = [
     "div.storePanel h1",
     "div#detailPanel h2",
     "div#detailPanel h1",
-    "di.leaflet-popup-content h2",
+    "div.leaflet-popup-content h2",
+    "div.leaflet-popup-content h1"
+]
 
 # Candidate selectors for the address field.
 ADDRESS_SELECTORS = [
@@ -76,7 +78,7 @@ DEFAULT_CATEGORIES = [
     "バーガー",
     "回転寿司/すし",
     "ラーメン",
-      "牛並",
+    "牛丼",
     "ファミレス",
     "カレー",
     "ファストフード",
