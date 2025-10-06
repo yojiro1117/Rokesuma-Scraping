@@ -25,7 +25,7 @@ from typing import List, Optional
 import pandas as pd
 import streamlit as st
 
-from selectors import DEFAULT_CATEGORIES
+from selectors_def import DEFAULT_CATEGORIES
 from scraper import scrape_locations, ScrapeResult
 
 
