@@ -1,0 +1,33 @@
+# packages.txt
+#
+# This file enumerates system‑level packages that Streamlit Cloud
+# should install via apt-get.  The ロケスマ scraping tool relies on
+# Playwright's Chromium browser; these libraries provide the
+# necessary runtime dependencies for headless Chromium on Linux.
+# See: https://playwright.dev/python/docs/troubleshooting#install-dependencies
+
+libglib2.0-0
+libnss3
+libatk1.0-0
+libatk-bridge2.0-0
+libx11-6
+libxcomposite1
+libxdamage1
+libxfixes3
+libxrandr2
+libxkbcommon0
+libxext6
+libdrm2
+libgbm1
+libpango-1.0-0
+libcairo2
+libasound2
+libxshmfence1
+libwayland-client0
+libwayland-egl1
+libwayland-cursor0
+libxcursor1
+libcups2
+libgtk-3-0
+ca-certificates
+fonts-liberation
