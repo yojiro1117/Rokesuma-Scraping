@@ -28,6 +28,14 @@ import pandas as pd
 from tenacity import retry, stop_after_attempt, wait_fixed
 from playwright.async_api import async_playwright
 
+import os
+import subprocess
+
+# Import selectors and default categories from selectors_def to avoid
+# clashing with Python's built‑in selectors module.  This module
+# contains lists of CSS selectors and a fallback category list for
+# situations where categories cannot be retrieved dynamically from
+# ロケスマWEB.
 from selectors_def import (
     MARKER_SELECTORS,
     STORE_NAME_SELECTORS,
@@ -44,6 +52,58 @@ from utils import (
     haversine_distance,
     unique_by_name_address,
 )
+
+# ---------------------------------------------------------------------------
+# Runtime bootstrap
+#
+# On Streamlit Cloud the post-install script is not automatically executed
+# after dependency installation.  As a result Playwright may not have
+# downloaded a Chromium build.  The following helper performs a one‑off
+# installation of Chromium into the persistent cache on the first call.
+# It uses the `PLAYWRIGHT_BROWSERS_PATH=0` convention to tell Playwright
+# to write downloaded browsers into a directory that persists across
+# runs.  If Chromium is already present then the installation is skipped.
+os.environ.setdefault("PLAYWRIGHT_BROWSERS_PATH", "0")
+
+def _ensure_chromium() -> None:
+    """Ensure that a Chromium browser is available for Playwright.
+
+    This function checks whether a Chromium build has already been
+    downloaded into Playwright's driver directory.  If not, it invokes
+    `python -m playwright install chromium` to fetch it.  Any
+    exceptions during installation are silently ignored as they will
+    surface later when Playwright attempts to launch the browser.
+    """
+    try:
+        # Playwright 1.46 introduced a helper to locate the driver
+        from playwright.__dist__ import get_driver_dir  # type: ignore
+        driver_dir = get_driver_dir()
+        if driver_dir and any("chromium" in name for name in os.listdir(driver_dir)):
+            return
+    except Exception:
+        # Fallback for older Playwright versions or unexpected errors
+        pass
+    try:
+        # Attempt installation with dependencies; falls back to browser only
+        subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium", "--with-deps"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+        return
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["python", "-m", "playwright", "install", "chromium"],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        # As a last resort do nothing; errors will be logged when launching
+        pass
 
 
 @dataclass
@@ -93,6 +153,9 @@ async def _scrape_async(
     category_list = categories or []
     if not category_list:
         category_list = DEFAULT_CATEGORIES
+
+    # Ensure the Chromium browser is installed before launching Playwright
+    _ensure_chromium()
 
     # Keep track of the origin coordinates after searching the centre
     origin_lat: Optional[float] = None
