@@ -286,14 +286,18 @@ def main() -> None:
             st.error("マップの表示に失敗しました。folium または streamlit‑folium がインストールされていることを確認してください。")
 
         # Embed the official ロケスマWEB site alongside the interactive map.
-        # A simple iframe is used for display purposes; note that we
-        # cannot programmatically control or extract data from this
-        # embedded page due to browser sandboxing, so it serves only
-        # as a visual reference for users during scraping.
-        # We avoid passing query parameters as they are not officially
-        # documented; instead we show the default landing page.
+        # The iframe source is constructed using the current latitude,
+        # longitude and zoom level.  Although ロケスマの URL パターンは公開されて
+        # いませんが、多くの地図サイトと同様に `@lat,lng,zoom` 形式で中心点と
+        # ズームを指定できます。 例えば https://www.locationsmart.org/@33.59,130.42,13z のように
+        # 表示します。 ここでは z の付いたズームを使用していますが、実際の動作は
+        # ロケスマ側の仕様に依存します。
+        iframe_url = (
+            f"https://www.locationsmart.org/"
+            f"@{st.session_state.lat:.6f},{st.session_state.lon:.6f},{st.session_state.zoom}z"
+        )
         components.html(
-            '<iframe src="https://www.locationsmart.org/" width="100%" height="400" frameborder="0"></iframe>',
+            f'<iframe src="{iframe_url}" width="100%" height="400" frameborder="0"></iframe>',
             height=400,
             scrolling=True,
         )
