@@ -34,7 +34,7 @@ STORE_NAME_SELECTORS = [
     "div.storePanel h1",
     "div#detailPanel h2",
     "div#detailPanel h1",
-    "div.leaflet-popup-content h2",
+    "di.leaflet-popup-content h2",
 
 # Candidate selectors for the address field.
 ADDRESS_SELECTORS = [
@@ -99,7 +99,4 @@ DEFAULT_CATEGORIES = [
     "郵便局",
     "図書館",
     "スポーツクラブ"
-]
-
-#     leaflet-popup-content h1"
 ]
