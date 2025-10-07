@@ -30,6 +30,7 @@ from scraper import scrape_locations, ScrapeResult
 
 import math
 import folium  # for map rendering
+from folium.plugins import MarkerCluster
 from streamlit_folium import st_folium
 from geopy.geocoders import Nominatim
 import streamlit.components.v1 as components
